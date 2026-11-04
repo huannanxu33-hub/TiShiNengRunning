@@ -75,6 +75,7 @@ class TsnRunServer:
         self._track_step_buckets = None
         self._track_sum_distance = None
         self._track_face_points = []
+        self._track_run_line = None  # 原始跑线（用于轨迹可视化底图）
         self.startLongitude = 0
         self.startLatitude = 0
 
@@ -466,6 +467,7 @@ class TsnRunServer:
             raise TiShiNengError('当前跑步类型不可用', 200000)
 
         runLinePath = await self.queryPath()
+        self._track_run_line = runLinePath
         startPoint = runLinePath[0]
         logger.info(f"起点信息：{startPoint}")
 
@@ -585,6 +587,60 @@ class TsnRunServer:
 
         await self.uploadRunPath(self._track_path, self._track_step_buckets, self._track_sum_distance)
 
+    def show_track_map(self):
+        """跑步完成后弹窗显示轨迹图（在独立线程中运行，避免阻塞事件循环）。"""
+        if not self._track_path or not self._track_run_line:
+            logger.warning('无轨迹数据可显示')
+            return
+        try:
+            import matplotlib
+            matplotlib.use('TkAgg')
+            import matplotlib.pyplot as plt
+        except ImportError:
+            logger.warning('未安装 matplotlib，跳过轨迹可视化。可 pip install matplotlib 后重试。')
+            return
+
+        from path_map import _lnglat_to_xy
+
+        run_line = self._track_run_line
+        origin_lng, origin_lat = run_line[0][0], run_line[0][1]
+
+        line_xy = [_lnglat_to_xy(p[0], p[1], origin_lng, origin_lat) for p in run_line]
+        lxs = [p[0] for p in line_xy]
+        lys = [p[1] for p in line_xy]
+
+        if self.isPublic:
+            pts = [(_lnglat_to_xy(p['o'], p['a'], origin_lng, origin_lat), p.get('s', 0)) for p in self._track_path]
+        else:
+            pts = [(_lnglat_to_xy(p['longitude'], p['latitude'], origin_lng, origin_lat), p.get('speed', 0))
+                   for p in self._track_path]
+        txs = [p[0][0] for p in pts]
+        tys = [p[0][1] for p in pts]
+        speeds = [p[1] for p in pts]
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+        ax.plot(lxs, lys, color='gray', linewidth=1.5, alpha=0.6, label='跑线')
+        sc = ax.scatter(txs, tys, c=speeds, cmap='coolwarm', s=8, label='轨迹(按速度着色)')
+        plt.colorbar(sc, ax=ax, label='速度 (m/s)')
+
+        if pts:
+            ax.scatter(txs[0], tys[0], color='green', s=140, marker='o', label='起点', zorder=5)
+            ax.scatter(txs[-1], tys[-1], color='red', s=140, marker='x', label='终点', zorder=5)
+        for fp in self._track_face_points or []:
+            fx, fy = _lnglat_to_xy(fp['lng'], fp['lat'], origin_lng, origin_lat)
+            ax.scatter(fx, fy, color='orange', s=120, marker='*', label='人脸点', zorder=6)
+
+        ax.set_xlabel('东向 (m)')
+        ax.set_ylabel('北向 (m)')
+        ax.set_title('跑步轨迹与跑线叠加')
+        ax.legend()
+        ax.set_aspect('equal')
+        fig.tight_layout()
+        plt.show()
+
     async def startRunHandle(self):
         logger.info("开始运行")
         await self.startRun()
+        # 跑步完成后弹窗显示轨迹图（子线程运行，不阻塞主流程）
+        import threading
+        threading.Thread(target=self.show_track_map, daemon=True).start()
